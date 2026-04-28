@@ -156,7 +156,8 @@ async function scrapeAnimePage(slug) {
   const episodes = [];
   const seenEp   = new Set();
 
-  $('ul.eplister li').each((_, li) => {
+  // div.eplister > ul > li  (confirmed from inspector breadcrumb)
+  $('div.eplister ul li, ul.eplister li').each((_, li) => {
     const a      = $(li).find('a').first();
     const epLink = a.attr('href') || '';
     if (!epLink) return;
@@ -181,9 +182,47 @@ async function scrapeAnimePage(slug) {
     }
   });
 
+  // Fallback: some WP anime themes embed episode data as JSON in a <script> tag
+  if (episodes.length === 0) {
+    $('script').each((_, el) => {
+      const src = $(el).html() || '';
+      const m = src.match(/var\s+episodeList\s*=\s*(\[[\s\S]*?\]);/) ||
+                src.match(/"episodes"\s*:\s*(\[[\s\S]*?\])/) ||
+                src.match(/episodes\s*=\s*(\[[\s\S]*?\])/);
+      if (!m) return;
+      try {
+        const epData = JSON.parse(m[1]);
+        for (const ep of epData) {
+          const num = parseInt(ep.num || ep.episode || ep.ep || ep.number || 0);
+          const u   = ep.url || ep.link || ep.href || '';
+          if (num > 0 && u && !seenEp.has(num)) {
+            seenEp.add(num);
+            episodes.push({ epNum: num, url: u.startsWith('http') ? u : `${BASE_URL}${u}`, released: new Date(0).toISOString() });
+          }
+        }
+      } catch (_) {}
+    });
+  }
+
+  // Last resort: scan all <a href> tags for episode URL pattern belonging to THIS show
+  if (episodes.length === 0) {
+    const slugBase = slug.split('-').slice(0, 4).join('-').toLowerCase();
+    $('a[href*="episode"]').each((_, el) => {
+      const href = $(el).attr('href') || '';
+      if (!href.toLowerCase().includes(slugBase)) return;
+      const m = href.match(/episode[^/]*?-([0-9]+)[-/]|\/episode-([0-9]+)/i);
+      if (!m) return;
+      const epNum = parseInt(m[1] || m[2]);
+      if (!epNum || epNum <= 0 || seenEp.has(epNum)) return;
+      seenEp.add(epNum);
+      episodes.push({ epNum, url: href.startsWith('http') ? href : `${BASE_URL}${href}`, released: new Date(0).toISOString() });
+    });
+  }
+
   episodes.sort((a, b) => a.epNum - b.epNum);
 
-  console.log(`[scrape] "${title}" — ${episodes.length} episodes`);
+  const eplisterFound = html.includes('eplister');
+  console.log(`[scrape] "${title}" — ${episodes.length} episodes | eplister in html: ${eplisterFound}`);
   return { title, poster, status, description, episodes };
 }
 
