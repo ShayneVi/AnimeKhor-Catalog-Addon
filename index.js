@@ -12,9 +12,9 @@ const BASE_URL = 'https://animekhor.org';
 // Cache
 // ---------------------------------------------------------------------------
 const cache = new Map();
-const CACHE_TTL      = 30 * 60 * 1000; // 30 min  — catalog pages
-const EPISODE_TTL    = 10 * 60 * 1000; // 10 min  — episode pages (update often)
-const DISK_CACHE_PATH = path.join('/tmp', 'animekhor_all.json');
+const CACHE_TTL   = 30 * 60 * 1000;
+const EPISODE_TTL = 10 * 60 * 1000;
+const DISK_CACHE  = path.join('/tmp', 'animekhor_all.json');
 
 function setCache(key, value, ttl = CACHE_TTL) {
   cache.set(key, { value, expires: Date.now() + ttl });
@@ -26,31 +26,27 @@ function getCache(key) {
   return e.value;
 }
 function saveToDisk(data) {
-  try { fs.writeFileSync(DISK_CACHE_PATH, JSON.stringify(data)); } catch (_) {}
+  try { fs.writeFileSync(DISK_CACHE, JSON.stringify(data)); } catch (_) {}
 }
 function loadFromDisk() {
-  try {
-    if (fs.existsSync(DISK_CACHE_PATH))
-      return JSON.parse(fs.readFileSync(DISK_CACHE_PATH, 'utf8'));
-  } catch (_) {}
+  try { if (fs.existsSync(DISK_CACHE)) return JSON.parse(fs.readFileSync(DISK_CACHE, 'utf8')); } catch (_) {}
   return null;
 }
 
 // ---------------------------------------------------------------------------
 // Fetch
 // ---------------------------------------------------------------------------
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.5',
+  'Referer': BASE_URL,
+};
+
 async function fetchHTML(url, ttl = CACHE_TTL) {
   const cached = getCache(url);
   if (cached) return cached;
-  const res = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.5',
-      'Referer': BASE_URL,
-    },
-    timeout: 15000,
-  });
+  const res = await fetch(url, { headers: HEADERS, timeout: 15000 });
   if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
   const html = await res.text();
   setCache(url, html, ttl);
@@ -58,30 +54,27 @@ async function fetchHTML(url, ttl = CACHE_TTL) {
 }
 
 // ---------------------------------------------------------------------------
-// ID helpers  (pipe separator — colons break Express :param parsing)
+// ID helpers
 // ---------------------------------------------------------------------------
-function makeId(slug)  { return `animekhor|${slug}`; }
+function makeId(slug)   { return `animekhor|${slug}`; }
 function slugFromId(id) { return id.replace(/^animekhor[|:]/, ''); }
 
 // ---------------------------------------------------------------------------
-// Parse series cards from a listing / A-Z page
-//
-// From the inspector (images 4 & 5):
-//   article.bs.bsx (or article.bs)
-//     div.ply  — overlay
-//     div.bt   — badge / type
-//     img.ts-post-image  — poster  (src or loading="lazy" so check both)
-//     div.tt   — title text
-//   The <a> wrapping everything has the href
+// Parse catalog cards  (article.bs structure confirmed from inspector)
+//   article.bs
+//     a[href="/anime/slug/"]
+//       div.ply
+//       div.bt
+//       img.ts-post-image   ← poster
+//       div.tt              ← title
 // ---------------------------------------------------------------------------
-function parseSeriesCards($) {
+function parseCards($) {
   const results = [];
-  const seen    = new Set();
+  const seen = new Set();
 
   $('article.bs').each((_, el) => {
-    // The whole card is usually wrapped in an <a>, or there's an <a> inside
-    const cardLink = $(el).find('a').first();
-    const href     = cardLink.attr('href') || $(el).closest('a').attr('href') || '';
+    const a     = $(el).find('a').first();
+    const href  = a.attr('href') || '';
     if (!href || !href.includes('/anime/') || seen.has(href)) return;
 
     const title =
@@ -91,17 +84,11 @@ function parseSeriesCards($) {
     if (!title) return;
 
     const img    = $(el).find('img').first();
-    const poster =
-      img.attr('src') ||
-      img.attr('data-src') ||
-      img.attr('data-lazy-src') || '';
+    const poster = img.attr('src') || img.attr('data-src') || img.attr('data-lazy-src') || '';
 
     seen.add(href);
-    const fullHref = href.startsWith('http') ? href : `${BASE_URL}${href}`;
-    const slug = fullHref
-      .replace(BASE_URL, '')
-      .replace(/^\/anime\//, '')
-      .replace(/\/$/, '');
+    const full = href.startsWith('http') ? href : `${BASE_URL}${href}`;
+    const slug = full.replace(BASE_URL, '').replace(/^\/anime\//, '').replace(/\/$/, '');
     if (slug) results.push({ slug, title, poster });
   });
 
@@ -109,136 +96,84 @@ function parseSeriesCards($) {
 }
 
 // ---------------------------------------------------------------------------
-// Scrape an anime detail page for episodes
+// Scrape episode list
 //
-// From the inspector (images 1–3):
-//   ul.eplister
-//     li[data-index="N"]
-//       a href="/the-demon-hunter-season-3-episode-5-subtitles-english-indonesian/"
-//         div.epl-num   → "5"
-//         div.epl-title → "Episode 5"
-//         div.epl-date  → "April 24, 2026"
-//
-// NOTE: the episode URL is at the ROOT level (no /anime/ prefix).
+// Confirmed HTML structure from debug/html endpoint:
+//   div.eplister
+//     div.ephead  (header row — skip)
+//     ul
+//       li[data-index="0"]
+//         a href="https://animekhor.org/the-demon-hunter-season-3-episode-5-subtitles-english-indonesian/"
+//           div.epl-num   → "5"
+//           div.epl-title → "Episode 5"
+//           div.epl-date  → "April 24, 2026"
 // ---------------------------------------------------------------------------
 async function scrapeAnimePage(slug) {
-  const url      = `${BASE_URL}/anime/${slug}/`;
-  const cacheKey = `anime_${slug}`;
-  const cached   = getCache(cacheKey);
-  let html;
+  const url = `${BASE_URL}/anime/${slug}/`;
+  const key = `ep_${slug}`;
+  let html  = getCache(key);
 
-  if (cached) {
-    html = cached;
-  } else {
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Referer': BASE_URL,
-      },
-      timeout: 15000,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+  if (!html) {
+    const res = await fetch(url, { headers: HEADERS, timeout: 15000 });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     html = await res.text();
-    setCache(cacheKey, html, EPISODE_TTL);
+    setCache(key, html, EPISODE_TTL);
   }
 
   const $ = cheerio.load(html);
 
-  // ---- Basic metadata ----
+  // Metadata
   const title       = $('h1.entry-title, h1').first().text().trim();
-  const poster      = $('img.ts-post-image').first().attr('src') ||
-                      $('div.thumb img, .poster img').first().attr('src') || '';
+  const poster      = $('img.ts-post-image').first().attr('src') || '';
   const description = $('div.entry-content p, div.synp p').first().text().trim() || '';
   const status      = $('span.statuson').first().text().trim() || '';
 
-  // ---- Episodes — exact selectors from inspector ----
+  // Episodes — scoped to div.eplister ul li ONLY (confirmed structure)
   const episodes = [];
-  const seenEp   = new Set();
+  const seen     = new Set();
 
-  // div.eplister > ul > li  (confirmed from inspector breadcrumb)
-  $('div.eplister ul li, ul.eplister li').each((_, li) => {
+  $('div.eplister ul li').each((_, li) => {
     const a      = $(li).find('a').first();
-    const epLink = a.attr('href') || '';
-    if (!epLink) return;
+    const href   = a.attr('href') || '';
+    if (!href) return;
 
-    // Episode number: div.epl-num inside the <a>
     const numText = $(li).find('.epl-num').first().text().trim();
     const epNum   = parseInt(numText, 10);
-    if (isNaN(epNum) || epNum <= 0) return;
+    if (isNaN(epNum) || epNum <= 0 || seen.has(epNum)) return;
 
-    // Release date: div.epl-date
-    const releaseText = $(li).find('.epl-date').first().text().trim();
-    let released      = new Date(0).toISOString();
-    if (releaseText) {
-      const parsed = new Date(releaseText);
-      if (!isNaN(parsed.getTime())) released = parsed.toISOString();
+    const dateText = $(li).find('.epl-date').first().text().trim();
+    let released   = new Date(0).toISOString();
+    if (dateText) {
+      const d = new Date(dateText);
+      if (!isNaN(d.getTime())) released = d.toISOString();
     }
 
-    if (!seenEp.has(epNum)) {
-      seenEp.add(epNum);
-      const fullUrl = epLink.startsWith('http') ? epLink : `${BASE_URL}${epLink}`;
-      episodes.push({ epNum, url: fullUrl, released });
-    }
+    seen.add(epNum);
+    episodes.push({
+      epNum,
+      url: href.startsWith('http') ? href : `${BASE_URL}${href}`,
+      released,
+    });
   });
 
-  // Fallback: some WP anime themes embed episode data as JSON in a <script> tag
-  if (episodes.length === 0) {
-    $('script').each((_, el) => {
-      const src = $(el).html() || '';
-      const m = src.match(/var\s+episodeList\s*=\s*(\[[\s\S]*?\]);/) ||
-                src.match(/"episodes"\s*:\s*(\[[\s\S]*?\])/) ||
-                src.match(/episodes\s*=\s*(\[[\s\S]*?\])/);
-      if (!m) return;
-      try {
-        const epData = JSON.parse(m[1]);
-        for (const ep of epData) {
-          const num = parseInt(ep.num || ep.episode || ep.ep || ep.number || 0);
-          const u   = ep.url || ep.link || ep.href || '';
-          if (num > 0 && u && !seenEp.has(num)) {
-            seenEp.add(num);
-            episodes.push({ epNum: num, url: u.startsWith('http') ? u : `${BASE_URL}${u}`, released: new Date(0).toISOString() });
-          }
-        }
-      } catch (_) {}
-    });
-  }
-
-  // Last resort: scan all <a href> tags for episode URL pattern belonging to THIS show
-  if (episodes.length === 0) {
-    const slugBase = slug.split('-').slice(0, 4).join('-').toLowerCase();
-    $('a[href*="episode"]').each((_, el) => {
-      const href = $(el).attr('href') || '';
-      if (!href.toLowerCase().includes(slugBase)) return;
-      const m = href.match(/episode[^/]*?-([0-9]+)[-/]|\/episode-([0-9]+)/i);
-      if (!m) return;
-      const epNum = parseInt(m[1] || m[2]);
-      if (!epNum || epNum <= 0 || seenEp.has(epNum)) return;
-      seenEp.add(epNum);
-      episodes.push({ epNum, url: href.startsWith('http') ? href : `${BASE_URL}${href}`, released: new Date(0).toISOString() });
-    });
-  }
-
   episodes.sort((a, b) => a.epNum - b.epNum);
-
-  const eplisterFound = html.includes('eplister');
-  console.log(`[scrape] "${title}" — ${episodes.length} episodes | eplister in html: ${eplisterFound}`);
+  console.log(`[meta] "${title}" slug="${slug}" episodes=${episodes.length}`);
   return { title, poster, status, description, episodes };
 }
 
 // ---------------------------------------------------------------------------
-// Scrape A-Z listing page
-// URL pattern: /a-z-lists/?show=A  or  /a-z-lists/page/2/?show=A
+// A-Z scraper
 // ---------------------------------------------------------------------------
-async function scrapeAZPage(letter, page = 1) {
-  const url = page === 1
+async function scrapeAZ(letter, page = 1) {
+  const url  = page === 1
     ? `${BASE_URL}/a-z-lists/?show=${letter}`
     : `${BASE_URL}/a-z-lists/page/${page}/?show=${letter}`;
-  const html    = await fetchHTML(url);
-  const $       = cheerio.load(html);
-  const series  = parseSeriesCards($);
-  const hasNext = $('a.next, a[rel="next"], .next.page-numbers').length > 0;
-  return { series, hasNext };
+  const html = await fetchHTML(url);
+  const $    = cheerio.load(html);
+  return {
+    series:  parseCards($),
+    hasNext: $('a.next, a[rel="next"], .next.page-numbers').length > 0,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -252,16 +187,20 @@ app.use((req, res, next) => {
 
 // ---------------------------------------------------------------------------
 // MANIFEST
+// No "stream" resource — we are a CATALOG+META addon only.
+// Your streaming addons (AIOStreams, FlixHQ, etc.) handle streams based on
+// the show name + episode number we expose via meta.
 // ---------------------------------------------------------------------------
 app.get('/manifest.json', (req, res) => {
   res.json({
     id: 'org.animekhor.catalog',
-    version: '1.3.0',
+    version: '1.4.0',
     name: 'AnimeKhor Donghua',
-    description: 'Full catalog of Chinese donghua from AnimeKhor.org.',
+    description: 'Catalog & metadata for Chinese donghua from AnimeKhor.org. Install alongside your streaming addons.',
     logo: 'https://animekhor.org/wp-content/uploads/2021/11/AnimeKhor_darkmode.png',
-    resources: ['catalog', 'meta', 'stream'],
+    resources: ['catalog', 'meta'],   // ← NO "stream" — let your other addons handle that
     types: ['series'],
+    idPrefixes: ['animekhor|'],
     catalogs: [
       {
         type: 'series',
@@ -281,26 +220,21 @@ app.get('/manifest.json', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Ongoing catalog
-// AnimeKhor lists ongoing series at /donghua-series/?status=Ongoing
-// Each card is article.bs  (same structure as A-Z)
+// Ongoing
 // ---------------------------------------------------------------------------
 async function getOngoing() {
   const cached = getCache('ongoing');
   if (cached) return cached;
 
-  // Try multiple possible URLs
-  const candidates = [
+  for (const url of [
     `${BASE_URL}/donghua-series/?status=Ongoing&order=latest`,
     `${BASE_URL}/donghua-series/`,
-    `${BASE_URL}/ongoing-donghua/`,
-  ];
-
-  for (const url of candidates) {
+    `${BASE_URL}/`,
+  ]) {
     try {
       const html  = await fetchHTML(url);
       const $     = cheerio.load(html);
-      const cards = parseSeriesCards($);
+      const cards = parseCards($);
       if (cards.length > 0) {
         const metas = cards.map(s => ({
           id: makeId(s.slug), type: 'series',
@@ -309,124 +243,89 @@ async function getOngoing() {
         setCache('ongoing', metas);
         return metas;
       }
-    } catch (e) { console.error(`getOngoing ${url}:`, e.message); }
+    } catch (e) { console.error('Ongoing:', e.message); }
   }
   return [];
 }
 
 // ---------------------------------------------------------------------------
-// All-series catalog  (A-Z scrape, background, disk-cached)
+// All series
 // ---------------------------------------------------------------------------
-let scrapeInProgress = false;
+let scraping = false;
 
-async function getAllSeries(searchQuery) {
-  // Search — use site's own search
-  if (searchQuery) {
+async function getAllSeries(search) {
+  if (search) {
     try {
-      const url  = `${BASE_URL}/?s=${encodeURIComponent(searchQuery)}`;
-      const html = await fetchHTML(url, 5 * 60 * 1000);
+      const html = await fetchHTML(`${BASE_URL}/?s=${encodeURIComponent(search)}`, 5 * 60 * 1000);
       const $    = cheerio.load(html);
-      return parseSeriesCards($).map(s => ({
+      return parseCards($).map(s => ({
         id: makeId(s.slug), type: 'series',
         name: s.title, poster: s.poster, posterShape: 'poster'
       }));
     } catch (e) { console.error('Search:', e.message); return []; }
   }
 
-  // Memory
-  const mem = getCache('all_series');
+  const mem  = getCache('all_series');
   if (mem) return mem;
 
-  // Disk
   const disk = loadFromDisk();
-  if (disk && disk.length > 0) {
-    setCache('all_series', disk);
-    return disk;
-  }
+  if (disk && disk.length > 0) { setCache('all_series', disk); return disk; }
 
-  // Nothing ready — kick off background scrape, return ongoing as placeholder
-  if (!scrapeInProgress) {
-    scrapeInProgress = true;
-    scrapeAllLetters().finally(() => { scrapeInProgress = false; });
-  }
-  console.log('Catalog not ready — returning ongoing as placeholder');
-  return getOngoing();
+  if (!scraping) { scraping = true; scrapeAllLetters().finally(() => { scraping = false; }); }
+  return getOngoing(); // placeholder while scrape runs
 }
 
 async function scrapeAllLetters() {
-  console.log('Starting A-Z scrape…');
+  console.log('A-Z scrape starting…');
   const letters = ['0-9', ...Array.from('ABCDEFGHIJKLMNOPQRSTUVWXYZ')];
-  const all     = [];
-  const seen    = new Set();
+  const all = [], seen = new Set();
 
   for (const letter of letters) {
     let page = 1, hasNext = true;
     while (hasNext && page <= 20) {
       try {
-        const result = await scrapeAZPage(letter, page);
-        for (const s of result.series) {
+        const r = await scrapeAZ(letter, page);
+        for (const s of r.series) {
           if (!seen.has(s.slug)) {
             seen.add(s.slug);
-            all.push({
-              id: makeId(s.slug), type: 'series',
-              name: s.title, poster: s.poster, posterShape: 'poster'
-            });
+            all.push({ id: makeId(s.slug), type: 'series', name: s.title, poster: s.poster, posterShape: 'poster' });
           }
         }
-        hasNext = result.hasNext;
+        hasNext = r.hasNext;
         page++;
         await new Promise(r => setTimeout(r, 350));
-      } catch (e) {
-        console.error(`A-Z [${letter} p${page}]:`, e.message);
-        hasNext = false;
-      }
+      } catch (e) { console.error(`A-Z [${letter} p${page}]:`, e.message); hasNext = false; }
     }
   }
 
-  if (all.length > 0) {
-    console.log(`A-Z done: ${all.length} series`);
-    setCache('all_series', all);
-    saveToDisk(all);
-  }
+  if (all.length > 0) { console.log(`A-Z done: ${all.length}`); setCache('all_series', all); saveToDisk(all); }
   return all;
 }
 
 // ---------------------------------------------------------------------------
-// CATALOG route
-// Handles both Stremio URL formats:
-//   /catalog/series/animekhor_all.json
-//   /catalog/series/animekhor_all/search=foo.json
-//   /catalog/series/animekhor_all/skip=20.json
+// CATALOG  (handles /catalog/:type/:id.json AND /catalog/:type/:id/extra.json)
 // ---------------------------------------------------------------------------
 app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
   const { id, extra } = req.params;
   let search = req.query.search || '';
   let skip   = parseInt(req.query.skip || '0');
-
   if (extra) {
-    for (const part of extra.split('&')) {
-      const [k, v] = part.split('=');
+    for (const p of extra.split('&')) {
+      const [k, v] = p.split('=');
       if (k === 'search') search = decodeURIComponent(v || '');
       if (k === 'skip')   skip   = parseInt(v || '0');
     }
   }
-
   try {
     let metas = [];
     if (id === 'animekhor_ongoing') {
       metas = await getOngoing();
-      if (search) {
-        const q = search.toLowerCase();
-        metas = metas.filter(m => m.name.toLowerCase().includes(q));
-      }
+      if (search) { const q = search.toLowerCase(); metas = metas.filter(m => m.name.toLowerCase().includes(q)); }
     } else if (id === 'animekhor_all') {
       metas = await getAllSeries(search);
     }
     res.json({ metas: metas.slice(skip, skip + 20) });
-  } catch (e) {
-    console.error('Catalog error:', e.message);
-    res.json({ metas: [] });
-  }
+  } catch (e) { console.error('Catalog:', e.message); res.json({ metas: [] }); }
 });
 
 // ---------------------------------------------------------------------------
@@ -435,7 +334,6 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
 app.get('/meta/:type/:id.json', async (req, res) => {
   const rawId = req.params.id;
   const slug  = slugFromId(rawId);
-
   try {
     const data = await scrapeAnimePage(slug);
     if (!data.title) return res.json({ meta: null });
@@ -446,7 +344,7 @@ app.get('/meta/:type/:id.json', async (req, res) => {
       season:   1,
       episode:  ep.epNum,
       released: ep.released,
-      overview: `Episode ${ep.epNum} of ${data.title}`
+      overview: `Episode ${ep.epNum} of ${data.title}`,
     }));
 
     res.json({
@@ -454,130 +352,62 @@ app.get('/meta/:type/:id.json', async (req, res) => {
         id: rawId, type: 'series',
         name: data.title, poster: data.poster,
         description: data.description, status: data.status,
-        videos, posterShape: 'poster'
+        videos, posterShape: 'poster',
       }
     });
-  } catch (e) {
-    console.error('Meta error:', e.message);
-    res.json({ meta: null });
-  }
+  } catch (e) { console.error('Meta:', e.message); res.json({ meta: null }); }
 });
 
 // ---------------------------------------------------------------------------
-// STREAM
-// ID format coming from Stremio: animekhor|slug:epNum
-// ---------------------------------------------------------------------------
-app.get('/stream/:type/:id.json', async (req, res) => {
-  const fullId    = req.params.id;
-  const lastColon = fullId.lastIndexOf(':');
-  if (lastColon === -1) return res.json({ streams: [] });
-
-  const epNum  = parseInt(fullId.slice(lastColon + 1));
-  const slug   = slugFromId(fullId.slice(0, lastColon));
-
-  try {
-    const data = await scrapeAnimePage(slug);
-    const ep   = data.episodes.find(e => e.epNum === epNum);
-    if (!ep) {
-      console.log(`Stream: ep ${epNum} not in ${slug} (found: ${data.episodes.map(e=>e.epNum)})`);
-      return res.json({ streams: [] });
-    }
-    res.json({
-      streams: [{
-        title: '🌐 Watch on AnimeKhor',
-        externalUrl: ep.url,
-        behaviorHints: { notWebReady: true }
-      }]
-    });
-  } catch (e) {
-    console.error('Stream error:', e.message);
-    res.json({ streams: [] });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// Health, warmup, debug
+// Debug & health
 // ---------------------------------------------------------------------------
 app.get('/', (req, res) => {
   res.json({
-    message: 'AnimeKhor Stremio Addon v1.3',
+    addon: 'AnimeKhor v1.4',
     install: `${req.protocol}://${req.get('host')}/manifest.json`,
-    catalog_ready: !!getCache('all_series') || fs.existsSync(DISK_CACHE_PATH),
-    scrape_in_progress: scrapeInProgress
+    catalog_ready: !!getCache('all_series') || fs.existsSync(DISK_CACHE),
+    scraping,
   });
 });
 
-// Hit this once after deploy to warm the full catalog
 app.get('/warmup', async (req, res) => {
-  if (scrapeInProgress) return res.json({ status: 'already running' });
+  if (scraping) return res.json({ status: 'already running' });
   if (getCache('all_series')) return res.json({ status: 'warm', count: getCache('all_series').length });
-  scrapeInProgress = true;
-  scrapeAllLetters().finally(() => { scrapeInProgress = false; });
+  scraping = true;
+  scrapeAllLetters().finally(() => { scraping = false; });
   res.json({ status: 'started' });
 });
 
-// Test episode parsing for any slug without opening Stremio
-// e.g. GET /debug/meta/the-demon-hunter-season-3-cang-yuan-tu-season-3
+// Test episode scraping: /debug/meta/the-demon-hunter-season-3-cang-yuan-tu-season-3
 app.get('/debug/meta/:slug(*)', async (req, res) => {
-  try {
-    const data = await scrapeAnimePage(req.params.slug);
-    res.json(data);
-  } catch (e) {
-    res.json({ error: e.message });
-  }
+  try { res.json(await scrapeAnimePage(req.params.slug)); }
+  catch (e) { res.json({ error: e.message }); }
 });
 
-// Test catalog card parsing for a single A-Z letter
-// e.g. GET /debug/az/A
-app.get('/debug/az/:letter', async (req, res) => {
-  try {
-    const result = await scrapeAZPage(req.params.letter.toUpperCase());
-    res.json(result);
-  } catch (e) {
-    res.json({ error: e.message });
-  }
-});
-
-// Returns raw HTML from animekhor — lets us see exactly what the server receives
-// e.g. GET /debug/html/the-demon-hunter-season-3-cang-yuan-tu-season-3
+// See raw HTML the server receives: /debug/html/the-demon-hunter-season-3-cang-yuan-tu-season-3
 app.get('/debug/html/:slug(*)', async (req, res) => {
   try {
-    const url = `${BASE_URL}/anime/${req.params.slug}/`;
-    const resp = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Referer': BASE_URL,
-      },
-      timeout: 15000,
-    });
-    const html = await resp.text();
-    const hasEplister = html.includes('eplister');
-    const hasEplNum   = html.includes('epl-num');
-    const eplisterIdx = html.indexOf('eplister');
-    const snippet     = eplisterIdx > -1 ? html.substring(eplisterIdx, eplisterIdx + 800) : 'NOT FOUND';
+    const url  = `${BASE_URL}/anime/${req.params.slug}/`;
+    const r    = await fetch(url, { headers: HEADERS, timeout: 15000 });
+    const html = await r.text();
+    const idx  = html.indexOf('eplister');
     res.json({
-      status: resp.status,
-      htmlBytes: html.length,
-      hasEplister,
-      hasEplNum,
-      eplisterSnippet: snippet,
+      status: r.status, htmlBytes: html.length,
+      hasEplister: idx > -1, hasEplNum: html.includes('epl-num'),
+      eplisterSnippet: idx > -1 ? html.substring(idx, idx + 800) : 'NOT FOUND',
     });
-  } catch (e) {
-    res.json({ error: e.message });
-  }
+  } catch (e) { res.json({ error: e.message }); }
+});
+
+// Test A-Z card parsing: /debug/az/A
+app.get('/debug/az/:letter', async (req, res) => {
+  try { res.json(await scrapeAZ(req.params.letter.toUpperCase())); }
+  catch (e) { res.json({ error: e.message }); }
 });
 
 // ---------------------------------------------------------------------------
 app.listen(PORT, () => {
   console.log(`AnimeKhor addon on port ${PORT}`);
-  console.log(`Install: http://localhost:${PORT}/manifest.json`);
-
-  // Pre-warm from disk on startup
   const disk = loadFromDisk();
-  if (disk && disk.length > 0) {
-    setCache('all_series', disk);
-    console.log(`Loaded ${disk.length} series from disk.`);
-  }
+  if (disk && disk.length > 0) { setCache('all_series', disk); console.log(`Disk cache: ${disk.length} series`); }
 });
